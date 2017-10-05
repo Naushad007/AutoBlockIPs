@@ -1,0 +1,86 @@
+#!/usr/bin/perl
+#
+# Filename:  /usr/local/sbin/sshd_autoblock
+# Copyright: Naushad <naushad@owasp.org>
+# License:   Same as Perl 5
+#
+# Temporarily block IPs that try to brute force attack sshd
+# automatically with ipset and rsyslog.
+#
+
+use strict;
+use warnings;
+
+# Put this in /etc/rsyslog.d/sshd_autoblock.conf and restart service
+#$template PipeFormat,"%timegenerated%|%HOSTNAME%|%syslogtag%|%msg%"
+#auth.info ^/usr/local/sbin/sshd_autoblock;PipeFormat
+
+# Put this in /usr/local/sbin/firewall_init.sh and start from /etc/rc.local
+#!/bin/bash
+#RED_IF="ppp0"
+## Flush tables
+#iptables -t filter -F
+#iptables -t nat -F
+#iptables -t mangle -F
+#iptables -t raw -F
+## Set default rules on all chains
+#iptables -P INPUT ACCEPT
+#iptables -P OUTPUT ACCEPT
+#iptables -P FORWARD ACCEPT
+## Flush ipset rules
+#ipset -F
+## Destroy all ip sets
+#ipset -X
+## Create ipset for automatically blocked IPs for 1h
+#ipset --create autoblock iptree --timeout 3600
+## Block any input traffic on red interface that is listed in autoblock set
+#iptables -A INPUT   -i $RED_IF -m set --match-set autoblock src -j DROP
+## Block IP for 1h if they try to connect to SMTP on public interface
+#iptables -A INPUT -i $RED_IF --protocol tcp --dport 25 -j LOG --log-prefix "AUTOBLOCKED (SMTP): "
+#iptables -A INPUT -i $RED_IF --protocol tcp --dport 25 -j SET --add-set autoblock src
+
+my $max_bad_password_attempts = 9;
+my $within_seconds = 60;
+my $autoblock_set_name = 'autoblock';
+my $logfile = "/var/log/sshd_autoblock.log";
+
+#############################################################
+my $line = shift @ARGV;
+exit unless defined $line;
+my ($date, $host, $program, $msg) = split(/\|/, $line);
+exit unless defined $program and $program =~ /sshd/;
+exit unless defined $msg and $msg =~ /Failed password/;
+if ( $msg =~ /from\s+(\S+)\s+/ ) {
+    my $ip = $1;
+    autoblock($ip,$date);
+}
+
+exit;
+
+sub autoblock {
+    my ($ip, $date) = @_;
+    open(my $fh, ">>", $logfile) or die "Can't open $logfile: $!";
+    for my $num (1 .. $max_bad_password_attempts) {
+        # Create ip set if needed
+        system("ipset", "--create", "login_failed_$num", "iptree", "--timeout", $within_seconds);
+
+        # Test if ip is already in set $num
+        my $rc = system("ipset", "--test", "login_failed_$num", $ip);
+        $rc = $rc >> 8; # Get normal exit code: 0 = found, 1 = not found
+
+        # If not found in set, add it and skip further processing
+        if ( $rc ) {
+            system("ipset", "-A", "login_failed_$num", $ip);
+            print $fh "$date|$ip added to set login_failed_$num\n";
+            last;
+        }
+
+        # If found at max level, autoblock ip
+        if ( $num == $max_bad_password_attempts ) {
+            system("ipset", "-A", $autoblock_set_name, $ip);
+            print $fh "$date|$ip added to set $autoblock_set_name\n";
+        }
+    }
+    close($fh);
+    return;
+}
